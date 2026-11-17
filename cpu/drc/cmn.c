@@ -16,7 +16,10 @@
 #else
 #define PICO_PAGE_ALIGN 4096
 #endif
+// a platform whose plat_mem_get_for_drc() always succeeds can leave this out
+#ifndef DRC_NO_TCACHE_DEFAULT
 u8 ALIGNED(PICO_PAGE_ALIGN) tcache_default[DRC_TCACHE_SIZE];
+#endif
 u8 *tcache;
 
 void drc_cmn_init(void)
@@ -24,8 +27,10 @@ void drc_cmn_init(void)
   int ret;
 
   tcache = plat_mem_get_for_drc(DRC_TCACHE_SIZE);
+#ifndef DRC_NO_TCACHE_DEFAULT
   if (tcache == NULL)
     tcache = tcache_default;
+#endif
 
   ret = plat_mem_set_exec(tcache, DRC_TCACHE_SIZE);
   elprintf(EL_STATUS, "drc_cmn_init: %p, %zd bytes: %d",

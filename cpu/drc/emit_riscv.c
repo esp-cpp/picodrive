@@ -1370,7 +1370,13 @@ static int emith_cond_check(int cond, int *r, int *s)
 // emitter ABI stuff
 #define emith_insn_ptr()	((u8 *)tcache_ptr)
 #define	emith_flush()		/**/
+#ifdef DRC_PLATFORM_CACHE_FLUSH
+// bare metal: the platform knows how to write back and invalidate its caches
+#define host_instructions_updated(base, end, force) \
+	cache_flush_d_inval_i((void *)(base), (void *)(end))
+#else
 #define host_instructions_updated(base, end, force) __builtin___clear_cache(base, end)
+#endif
 #define	emith_update_cache()	/**/
 #define emith_rw_offs_max()	0x7ff
 #define emith_uext_ptr(r)	/**/

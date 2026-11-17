@@ -729,9 +729,26 @@ static void p32x_vdp_write16(u32 a, u32 d, SH2 *sh2)
     int len = Pico32x.vdp_regs[4 / 2] + 1;
     int len1 = len;
     a = Pico32x.vdp_regs[6 / 2];
-    while (len1--) {
-      dram[a] = d;
-      a = (a & 0xff00) | ((a + 1) & 0xff);
+    // the fill wraps within its 256 word line: at most two runs
+    while (len1 > 0) {
+      int run = 0x100 - (a & 0xff);
+      u16 *p = dram + a;
+      if (run > len1)
+        run = len1;
+      len1 -= run;
+      a = (a & 0xff00) | ((a + run) & 0xff);
+      if (run > 2 && ((uintptr_t)p & 2)) {
+        *p++ = d;
+        run--;
+      }
+      if (run > 2) {
+        u32 d2 = (d & 0xffff) * 0x10001, *p32 = (u32 *)p;
+        for (; run >= 2; run -= 2)
+          *p32++ = d2;
+        p = (u16 *)p32;
+      }
+      while (run--)
+        *p++ = d;
     }
     Pico32x.vdp_regs[0x06 / 2] = a;
     Pico32x.vdp_regs[0x08 / 2] = d;

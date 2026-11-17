@@ -374,16 +374,27 @@ static const int tcache_sizes[TCACHE_BUFFERS] = {
   DRC_TCACHE_SIZE / 32, // ... slave
 };
 
-#define BLOCK_MAX_COUNT(tcid)		((tcid) ? 256 : 32*256)
+// (the limits for the main cache can be set smaller where memory is short:
+// the rings then recycle the oldest blocks sooner)
+#ifndef DRC_MAX_BLOCKS
+#define DRC_MAX_BLOCKS 32*256
+#endif
+#define BLOCK_MAX_COUNT(tcid)		((tcid) ? 256 : DRC_MAX_BLOCKS)
 static struct ring_buffer block_ring[TCACHE_BUFFERS];
 static struct block_desc *block_tables[TCACHE_BUFFERS];
 
-#define ENTRY_MAX_COUNT(tcid)		((tcid) ? 8*512 : 256*512)
+#ifndef DRC_MAX_ENTRIES
+#define DRC_MAX_ENTRIES 256*512
+#endif
+#define ENTRY_MAX_COUNT(tcid)		((tcid) ? 8*512 : DRC_MAX_ENTRIES)
 static struct ring_buffer entry_ring[TCACHE_BUFFERS];
 static struct block_entry *entry_tables[TCACHE_BUFFERS];
 
 // we have block_link_pool to avoid using mallocs
-#define BLOCK_LINK_MAX_COUNT(tcid)	((tcid) ? 512 : 32*512)
+#ifndef DRC_MAX_LINKS
+#define DRC_MAX_LINKS 32*512
+#endif
+#define BLOCK_LINK_MAX_COUNT(tcid)	((tcid) ? 512 : DRC_MAX_LINKS)
 static struct block_link *block_link_pool[TCACHE_BUFFERS]; 
 static int block_link_pool_counts[TCACHE_BUFFERS];
 static struct block_link **unresolved_links[TCACHE_BUFFERS];
@@ -405,7 +416,9 @@ static struct block_entry **hash_tables[TCACHE_BUFFERS];
 #define HASH_FUNC(hash_tab, addr, mask) \
   (hash_tab)[((addr) >> 1) & (mask)]
 
+#ifndef BLOCK_LIST_MAX_COUNT
 #define BLOCK_LIST_MAX_COUNT		(64*1024)
+#endif
 static struct block_list *block_list_pool; 
 static int block_list_pool_count;
 static struct block_list *blist_free;

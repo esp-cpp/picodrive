@@ -1,5 +1,7 @@
 
+#ifndef DRC_TCACHE_SIZE
 #define DRC_TCACHE_SIZE         (4*1024*1024)
+#endif
 
 extern u8 *tcache;
 

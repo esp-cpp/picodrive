@@ -587,7 +587,7 @@ int pm_seek(pm_file *stream, long offset, int whence)
       PicoIn.osdMessage("Decompressing data...");
 
     while (offset > 0) {
-      char buf[16 * 1024];
+      char buf[1024]; // (small: some hosts run this on a small stack)
       size_t l = offset > sizeof(buf) ? sizeof(buf) : offset;
       ret = pm_read(buf, l, stream);
       if (ret != l)
