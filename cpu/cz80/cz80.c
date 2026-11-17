@@ -66,8 +66,9 @@ static UINT8 ALIGN_DATA SZ_BIT[256];
 static UINT8 ALIGN_DATA SZHV_inc[256];
 static UINT8 ALIGN_DATA SZHV_dec[256];
 #if CZ80_BIG_FLAGS_ARRAY
-static UINT8 ALIGN_DATA SZHVC_add[2*256*256];
-static UINT8 ALIGN_DATA SZHVC_sub[2*256*256];
+// (allocated by Cz80_Init: 256 KB a platform may not want resident)
+static UINT8 *SZHVC_add;
+static UINT8 *SZHVC_sub;
 #endif
 
 
@@ -136,6 +137,10 @@ void Cz80_Init(cz80_struc *CPU)
 	}
 
 #if CZ80_BIG_FLAGS_ARRAY
+	if (!SZHVC_add)
+		SZHVC_add = malloc(2*256*256);
+	if (!SZHVC_sub)
+		SZHVC_sub = malloc(2*256*256);
 	padd = &SZHVC_add[  0*256];
 	padc = &SZHVC_add[256*256];
 	psub = &SZHVC_sub[  0*256];
@@ -207,6 +212,14 @@ void Cz80_Init(cz80_struc *CPU)
 /*--------------------------------------------------------
 	CPUƒŠƒZƒbƒg
 --------------------------------------------------------*/
+
+// the flag tables back to the heap (Cz80_Init builds them again)
+void Cz80_FreeTables(void)
+{
+	free(SZHVC_add);
+	free(SZHVC_sub);
+	SZHVC_add = SZHVC_sub = NULL;
+}
 
 void Cz80_Reset(cz80_struc *CPU)
 {

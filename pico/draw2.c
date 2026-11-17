@@ -24,12 +24,13 @@
 #define LINE_WIDTH 328
 #endif
 
-static unsigned char PicoDraw2FB_[LINE_WIDTH * (8+240+8) + 8];
+// (allocated by PicoDraw2Init: 82 KB a platform may not want resident)
+static unsigned char *PicoDraw2FB_;
 
 static u32 HighCache2A[2*41*(TILE_ROWS+1)+1+1]; // caches for high layers
 static u32 HighCache2B[2*41*(TILE_ROWS+1)+1+1];
 
-unsigned short *PicoCramHigh=PicoMem.cram; // pointer to CRAM buff (0x40 shorts), converted to native device color (works only with 16bit for now)
+unsigned short *PicoCramHigh; // (set by PicoDraw2Init: PicoMem may not be static) // pointer to CRAM buff (0x40 shorts), converted to native device color (works only with 16bit for now)
 void (*PicoPrepareCram)(void) = NULL;      // prepares PicoCramHigh for renderer to use
 
 
@@ -745,7 +746,18 @@ void PicoDraw2SetOutBuf(void *dest, int incr)
 	}
 }
 
+// the frame buffer back to the heap (PicoDraw2Init allocates it again)
+void PicoDraw2Free(void)
+{
+	free(PicoDraw2FB_);
+	PicoDraw2FB_ = NULL;
+	Pico.est.Draw2FB = NULL;
+}
+
 void PicoDraw2Init(void)
 {
+	if (!PicoDraw2FB_)
+		PicoDraw2FB_ = calloc(1, LINE_WIDTH * (8+240+8) + 8);
+	PicoCramHigh = PicoMem.cram;
 	PicoDraw2SetOutBuf(NULL, 0);
 }

@@ -13,7 +13,11 @@
 #include "sound/vgm.h"
 
 struct Pico Pico;
-struct PicoMem PicoMem;
+#ifdef PICOMEM_ALLOC
+struct PicoMem_s *PicoMem_p;
+#else
+struct PicoMem_s PicoMem;
+#endif
 PicoInterface PicoIn;
 
 void (*PicoResetHook)(void) = NULL;
@@ -24,6 +28,10 @@ void PicoInit(void)
 {
   // Blank space for state:
   memset(&Pico,0,sizeof(Pico));
+#ifdef PICOMEM_ALLOC
+  if (!PicoMem_p)
+    PicoMem_p = malloc(sizeof(*PicoMem_p));
+#endif
   memset(&PicoMem,0,sizeof(PicoMem));
   memset(&PicoIn.pad,0,sizeof(PicoIn.pad));
   memset(&PicoIn.padInt,0,sizeof(PicoIn.padInt));
@@ -63,6 +71,10 @@ void PicoExit(void)
   Pico.sv.data = NULL;
   Pico.sv.start = Pico.sv.end = 0;
   pevt_dump();
+#ifdef PICOMEM_ALLOC
+  free(PicoMem_p);
+  PicoMem_p = NULL;
+#endif
 }
 
 void PicoPower(void)
@@ -287,7 +299,8 @@ void PicoSyncVideo(int to, int off, int on)
 {
   // in case of 32X, sync that first to catch 32X mid-frame changes
   // NB that may sync the MD VDP as well, up to the last line
-  if (PicoIn.AHW & PAHW_32X)
+  // (not when the SH-2s run in parallel: they don't draw mid-frame then)
+  if ((PicoIn.AHW & PAHW_32X) && !p32x_par_on)
     p32x_sync_sh2s(Pico.t.m68c_frame_start + (int)(488.5*2)*to/2 - 1);
 
   PicoDrawSync(to, off, on);

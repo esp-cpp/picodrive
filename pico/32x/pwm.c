@@ -267,6 +267,10 @@ void p32x_pwm_write16(u32 a, unsigned int d, SH2 *sh2, unsigned int m68k_cycles)
 
 void p32x_pwm_update(s32 *buf32, int length, int stereo)
 {
+#ifdef P32X_SH2_THREAD
+  if (p32x_par_on)
+    p32x_par_pwm_sync(SekCyclesDone());
+#endif
   short *pwmb;
   int step;
   int p = 0;
@@ -277,8 +281,10 @@ void p32x_pwm_update(s32 *buf32, int length, int stereo)
   xmd = Pico32x.regs[0x30 / 2] & 0x0f;
   if (xmd == 0x00 || xmd == 0x0f)
     goto out; // silence, or invalid
-  if (pwm.silent)
+  if (pwm.silent) {
+    P32X_PAR_LEAVE();
     return;
+  }
 
   step = (pwm.ptr << 16) / length;
   pwmb = Pico32xMem->pwm;
@@ -369,6 +375,7 @@ void p32x_pwm_update(s32 *buf32, int length, int stereo)
 out:
   pwm.ptr = 0;
   pwm.silent = pwm.current[0] == 0 && pwm.current[1] == 0;
+  P32X_PAR_LEAVE();
 }
 
 void p32x_pwm_state_loaded(void)

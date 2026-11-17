@@ -5255,7 +5255,7 @@ end_op:
     insns_compiled, host_insn_count, (float)host_insn_count / insns_compiled);
   if ((sh2->pc & 0xc6000000) == 0x02000000) { // ROM
     dbg(2, "  hash collisions %d/%d", hash_collisions, block_ring[tcache_id].used);
-    Pico32x.emu_flags |= P32XF_DRC_ROM_C;
+    P32X_FLAGS_SET(P32XF_DRC_ROM_C);
   }
 /*
  printf("~~~\n");
@@ -5926,7 +5926,7 @@ void sh2_drc_flush_all(void)
   dr_flush_tcache(0);
   dr_flush_tcache(1);
   dr_flush_tcache(2);
-  Pico32x.emu_flags &= ~P32XF_DRC_ROM_C;
+  P32X_FLAGS_CLR(P32XF_DRC_ROM_C);
 }
 
 void sh2_drc_mem_setup(SH2 *sh2)

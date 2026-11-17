@@ -184,7 +184,8 @@ void memset32(void *dest, int c, int count);
 */
 //#define TL_TAB_LEN (13*2*TL_RES_LEN)
 #define TL_TAB_LEN (13*TL_RES_LEN*256/8) // 106496*2
-UINT16 ym_tl_tab[TL_TAB_LEN];
+// (allocated by init_tables, as lfo_pm_table: 336 KB a platform may not want resident)
+UINT16 *ym_tl_tab;
 
 /* ~3K wasted but oh well */
 UINT16 ym_tl_tab2[13*TL_RES_LEN];
@@ -513,7 +514,7 @@ static const UINT8 lfo_pm_output[7*8][8]={ /* 7 bits meaningful (of F-NUMBER), 8
 };
 
 /* all 128 LFO PM waveforms */
-static INT32 lfo_pm_table[128*8*32]; /* 128 combinations of 7 bits meaningful (of F-NUMBER), 8 LFO depths, 32 LFO output levels per one depth */
+static INT32 *lfo_pm_table; /* [128*8*32] */ /* 128 combinations of 7 bits meaningful (of F-NUMBER), 8 LFO depths, 32 LFO output levels per one depth */
 
 /* register number to channel number , slot offset */
 #define OPN_CHAN(N) (N&3)
@@ -1466,6 +1467,10 @@ static void init_tables(void)
 
 	if (ym_init_tab) return;
 	ym_init_tab = 1;
+	if (!ym_tl_tab)
+		ym_tl_tab = malloc(TL_TAB_LEN * sizeof(*ym_tl_tab));
+	if (!lfo_pm_table)
+		lfo_pm_table = malloc(128*8*32 * sizeof(*lfo_pm_table));
 
 	for (i=0; i < 256; i++)
 	{
@@ -1805,6 +1810,16 @@ int YM2612UpdateOne_(s32 *buffer, int length, int stereo, int is_buf_empty)
 	return active_chs; // 1 if buffer updated
 }
 
+
+/* the big tables back to the heap (init_tables builds them again) */
+void YM2612_FreeTables(void)
+{
+	free(ym_tl_tab);
+	free(lfo_pm_table);
+	ym_tl_tab = NULL;
+	lfo_pm_table = NULL;
+	ym_init_tab = 0;
+}
 
 /* initialize YM2612 emulator */
 void YM2612Init_(int clock, int rate, int flags)

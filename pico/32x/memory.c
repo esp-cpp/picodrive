@@ -80,13 +80,13 @@ static int m68k_poll_detect(u32 a, u32 cycles, u32 flags)
         elprintf(EL_32X, "m68k poll addr %08x, cyc %u",
           a, cycles - m68k_poll.cycles);
       }
-      Pico32x.emu_flags |= flags;
+      P32X_FLAGS_SET(flags);
       ret = 1;
     }
   }
   else {
     // reset poll state in case of restart by interrupt
-    Pico32x.emu_flags &= ~(P32XF_68KCPOLL|P32XF_68KVPOLL);
+    P32X_FLAGS_CLR(P32XF_68KCPOLL|P32XF_68KVPOLL);
     SekSetStop(0);
     m68k_poll.cnt = 0;
     if (!match) {
@@ -107,7 +107,12 @@ void p32x_m68k_poll_event(u32 a, u32 flags)
   if ((Pico32x.emu_flags & flags) && match) {
     elprintf(EL_32X, "m68k poll event a=%08x %02x -> %02x", a, Pico32x.emu_flags,
       Pico32x.emu_flags & ~flags);
-    Pico32x.emu_flags &= ~flags;
+    P32X_FLAGS_CLR(flags);
+#ifdef P32X_SH2_THREAD
+    if (p32x_par_on)
+      p32x_par_wake_m68k(); // (the 68k's own thread restarts it)
+    else
+#endif
     SekSetStop(0);
   }
 
@@ -192,6 +197,15 @@ struct sh2_poll_fifo {
   int cpu;
 } sh2_poll_fifo[PFIFO_CNT][PFIFO_SZ];
 unsigned sh2_poll_rd[PFIFO_CNT], sh2_poll_wr[PFIFO_CNT]; // ringbuffer pointers
+#ifdef P32X_SH2_THREAD
+// (both threads use the fifo: the 68k's comm reads don't stop the SH-2s)
+static volatile int sh2_poll_lock;
+#define PFIFO_LOCK() do { if (p32x_par_on) while (__atomic_exchange_n(&sh2_poll_lock, 1, __ATOMIC_ACQUIRE)) ; } while (0)
+#define PFIFO_UNLOCK() do { if (p32x_par_on) __atomic_store_n(&sh2_poll_lock, 0, __ATOMIC_RELEASE); } while (0)
+#else
+#define PFIFO_LOCK()
+#define PFIFO_UNLOCK()
+#endif
 
 static NOINLINE u32 sh2_poll_read(u32 a, u32 d, unsigned int cycles, SH2* sh2)
 {
@@ -203,6 +217,7 @@ static NOINLINE u32 sh2_poll_read(u32 a, u32 d, unsigned int cycles, SH2* sh2)
 
   a &= ~0x20000000; // ignore writethrough bit
   // fetch oldest write to address from fifo, but stop when reaching the present
+  PFIFO_LOCK();
   idx = sh2_poll_rd[hix];
   while (idx != sh2_poll_wr[hix] && CYCLES_GE(cycles, fifo[idx].cycles)) {
     p = &fifo[idx];
@@ -220,6 +235,7 @@ static NOINLINE u32 sh2_poll_read(u32 a, u32 d, unsigned int cycles, SH2* sh2)
       }
     }
   }
+  PFIFO_UNLOCK();
   return d;
 }
 
@@ -229,10 +245,12 @@ static NOINLINE void sh2_poll_write(u32 a, u32 d, unsigned int cycles, SH2 *sh2)
   struct sh2_poll_fifo *fifo = sh2_poll_fifo[hix];
   struct sh2_poll_fifo *q;
   int cpu = 1 << (sh2 ? sh2->is_slave : 2);
-  unsigned rd = sh2_poll_rd[hix], wr = sh2_poll_wr[hix];
+  unsigned rd, wr;
   unsigned idx, nrd;
 
   a &= ~0x20000000; // ignore writethrough bit
+  PFIFO_LOCK();
+  rd = sh2_poll_rd[hix], wr = sh2_poll_wr[hix];
 
   // throw out any values written by other cpus, plus heading cancelled stuff
   for (idx = nrd = wr; idx != rd; ) {
@@ -263,6 +281,7 @@ static NOINLINE void sh2_poll_write(u32 a, u32 d, unsigned int cycles, SH2 *sh2)
   }
 
   sh2_poll_rd[hix] = rd; sh2_poll_wr[hix] = wr;
+  PFIFO_UNLOCK();
 }
 
 u32 REGPARM(3) p32x_sh2_poll_memory8(u32 a, u32 d, SH2 *sh2)
@@ -356,7 +375,7 @@ static u32 p32x_reg_read16(u32 a)
   if ((a & 0x30) == 0x20) {
     unsigned int cycles = SekCyclesDone();
 
-    if (CYCLES_GT(cycles - msh2.m68krcycles_done, 244))
+    if (!p32x_par_on && CYCLES_GT(cycles - msh2.m68krcycles_done, 244))
       p32x_sync_sh2s(cycles);
 
     if (m68k_poll_detect(a, cycles, P32XF_68KCPOLL))
@@ -367,7 +386,7 @@ static u32 p32x_reg_read16(u32 a)
 
   if (a == 2) { // INTM, INTS
     unsigned int cycles = SekCyclesDone();
-    if (CYCLES_GT(cycles - msh2.m68krcycles_done, 64))
+    if (!p32x_par_on && CYCLES_GT(cycles - msh2.m68krcycles_done, 64))
       p32x_sync_sh2s(cycles);
     goto out;
   }
@@ -1017,7 +1036,7 @@ irls:
 // 32x 68k handlers
 
 // after ADEN
-static u32 PicoRead8_32x_on(u32 a)
+static u32 PicoRead8_32x_on_(u32 a)
 {
   u32 d = 0;
   if ((a & 0xffc0) == 0x5100) { // a15100
@@ -1061,7 +1080,37 @@ out:
   return d;
 }
 
-static u32 PicoRead16_32x_on(u32 a)
+#ifdef PD_SH2_STATS
+unsigned int pd_stat_acc[2][0x100]; // [write][(a & 0x1fe) >> 1]
+#define ACC_STAT(w, a) pd_stat_acc[w][((a) & 0x1fe) >> 1]++
+#else
+#define ACC_STAT(w, a)
+#endif
+#ifdef P32X_SH2_THREAD
+// the 68k's 32X accesses (regs, VDP, palette) with the SH-2s stopped near
+// its time (see p32x_par_enter)
+static u32 PicoRead8_32x_on(u32 a)
+{
+  u32 d;
+  if ((a & 0xfc00) != 0x5000 || !p32x_par_on)
+    return PicoRead8_32x_on_(a);
+  // comm ports and INTM/INTS: what the 68k polls, read with the SH-2s near
+  // its time but going on (P32X_PAR_LAX, the serial scheduler's comm slack)
+  if ((a & 0xffc0) == 0x5100 && ((a & 0x30) == 0x20 || (a & 0x3e) == 0x02)) {
+    p32x_par_catch_up(SekCyclesDone(), (a & 0x30) == 0x20 ? 244 : 64);
+    return PicoRead8_32x_on_(a);
+  }
+  ACC_STAT(0, a);
+  p32x_par_enter(SekCyclesDone());
+  d = PicoRead8_32x_on_(a);
+  p32x_par_leave();
+  return d;
+}
+#else
+#define PicoRead8_32x_on PicoRead8_32x_on_
+#endif
+
+static u32 PicoRead16_32x_on_(u32 a)
 {
   u32 d = 0;
   if ((a & 0xffc0) == 0x5100) { // a15100
@@ -1099,7 +1148,31 @@ out:
   return d;
 }
 
-static void PicoWrite8_32x_on(u32 a, u32 d)
+#ifdef P32X_SH2_THREAD
+// the 68k's 32X accesses (regs, VDP, palette) with the SH-2s stopped near
+// its time (see p32x_par_enter)
+static u32 PicoRead16_32x_on(u32 a)
+{
+  u32 d;
+  if ((a & 0xfc00) != 0x5000 || !p32x_par_on)
+    return PicoRead16_32x_on_(a);
+  // comm ports and INTM/INTS: what the 68k polls, read with the SH-2s near
+  // its time but going on (P32X_PAR_LAX, the serial scheduler's comm slack)
+  if ((a & 0xffc0) == 0x5100 && ((a & 0x30) == 0x20 || (a & 0x3e) == 0x02)) {
+    p32x_par_catch_up(SekCyclesDone(), (a & 0x30) == 0x20 ? 244 : 64);
+    return PicoRead16_32x_on_(a);
+  }
+  ACC_STAT(0, a);
+  p32x_par_enter(SekCyclesDone());
+  d = PicoRead16_32x_on_(a);
+  p32x_par_leave();
+  return d;
+}
+#else
+#define PicoRead16_32x_on PicoRead16_32x_on_
+#endif
+
+static void PicoWrite8_32x_on_(u32 a, u32 d)
 {
   if ((a & 0xfc00) == 0x5000)
     elprintf(EL_32X, "m68k 32x w8  [%06x]   %02x @%06x", a, d & 0xff, SekPc);
@@ -1134,6 +1207,22 @@ static void PicoWrite8_32x_on(u32 a, u32 d)
   elprintf(EL_UIO, "m68k unmapped w8  [%06x]   %02x @%06x", a, d & 0xff, SekPc);
 }
 
+#ifdef P32X_SH2_THREAD
+static void PicoWrite8_32x_on(u32 a, u32 d)
+{
+  if ((a & 0xfc00) != 0x5000 || !p32x_par_on) {
+    PicoWrite8_32x_on_(a, d);
+    return;
+  }
+  ACC_STAT(1, a);
+  p32x_par_enter(SekCyclesDone());
+  PicoWrite8_32x_on_(a, d);
+  p32x_par_leave();
+}
+#else
+#define PicoWrite8_32x_on PicoWrite8_32x_on_
+#endif
+
 static void PicoWrite8_32x_on_io(u32 a, u32 d)
 {
   PicoWrite8_io(a, d);
@@ -1155,7 +1244,7 @@ static void PicoWrite8_32x_on_io_ssf2(u32 a, u32 d)
     bank_switch_rom_68k(Pico32x.regs[4 / 2]);
 }
 
-static void PicoWrite16_32x_on(u32 a, u32 d)
+static void PicoWrite16_32x_on_(u32 a, u32 d)
 {
   if ((a & 0xfc00) == 0x5000)
     elprintf(EL_32X, "m68k 32x w16 [%06x] %04x @%06x", a, d & 0xffff, SekPc);
@@ -1187,6 +1276,22 @@ static void PicoWrite16_32x_on(u32 a, u32 d)
 
   elprintf(EL_UIO, "m68k unmapped w16 [%06x] %04x @%06x", a, d & 0xffff, SekPc);
 }
+
+#ifdef P32X_SH2_THREAD
+static void PicoWrite16_32x_on(u32 a, u32 d)
+{
+  if ((a & 0xfc00) != 0x5000 || !p32x_par_on) {
+    PicoWrite16_32x_on_(a, d);
+    return;
+  }
+  ACC_STAT(1, a);
+  p32x_par_enter(SekCyclesDone());
+  PicoWrite16_32x_on_(a, d);
+  p32x_par_leave();
+}
+#else
+#define PicoWrite16_32x_on PicoWrite16_32x_on_
+#endif
 
 static void PicoWrite16_32x_on_io(u32 a, u32 d)
 {
@@ -2115,8 +2220,10 @@ static void z80_md_bank_write_32x(u32 a, unsigned char d)
 
   addr68k = Pico.m.z80_bank68k << 15;
   addr68k += a & 0x7fff;
-  if ((addr68k & 0xfff000) == 0xa15000)
-    Pico32x.emu_flags |= P32XF_Z80_32X_IO;
+  if ((addr68k & 0xfff000) == 0xa15000) {
+    P32X_PAR_BARRIER();
+    P32X_FLAGS_SET(P32XF_Z80_32X_IO);
+  }
 
   elprintf(EL_Z80BNK, "z80->68k w8 [%06x] %02x", addr68k, d);
   m68k_write8(addr68k, d);

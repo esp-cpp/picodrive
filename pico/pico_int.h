@@ -426,7 +426,7 @@ struct PicoEState
   int SonicPalCount;
 };
 
-struct PicoMem
+struct PicoMem_s
 {
   unsigned char ram[0x10000];  // 0x00000 scratch ram
   union {                      // vram is byteswapped for easier reads when drawing
@@ -840,7 +840,13 @@ void pcd_state_loaded_mem(void);
 
 // pico.c
 extern struct Pico Pico;
-extern struct PicoMem PicoMem;
+#ifdef PICOMEM_ALLOC
+// the platform keeps it out of .bss: allocated by PicoInit, freed by PicoExit
+extern struct PicoMem_s *PicoMem_p;
+#define PicoMem (*PicoMem_p)
+#else
+extern struct PicoMem_s PicoMem;
+#endif
 extern void (*PicoResetHook)(void);
 extern void (*PicoLineHook)(void);
 PICO_INTERNAL int  CheckDMA(int cycles);
@@ -1086,9 +1092,14 @@ enum p32x_event {
   P32X_EVENT_HINT,
   P32X_EVENT_MTIMER,
   P32X_EVENT_STIMER,
+  P32X_EVENT_VBLANK,     // (with P32X_SH2_THREAD)
+  P32X_EVENT_VBLANK_END,
   P32X_EVENT_COUNT,
 };
 extern unsigned int p32x_event_times[P32X_EVENT_COUNT];
+#ifdef P32X_SH2_THREAD
+void p32x_par_post_event(enum p32x_event event, unsigned int m68k_now);
+#endif
 
 void Pico32xInit(void);
 void PicoPower32x(void);
@@ -1101,6 +1112,47 @@ void Pico32xDrawSync(SH2 *sh2);
 void Pico32xStateLoaded(int is_early);
 void Pico32xPrepare(void);
 void p32x_sync_sh2s(unsigned int m68k_target);
+#ifdef P32X_SH2_THREAD
+// The SH-2s on a thread of their own (another core): they chase the 68k,
+// running up to m68k times it already passed (p32x_par_release). Whenever the
+// 68k side touches 32X state it first waits for them to reach its time and
+// stop (p32x_par_barrier), so everything stays as ordered as in the serial
+// scheduler. The platform runs p32x_par_work() on its thread and implements
+// plat_sh2_thread_kick() to wake that thread when new work is posted.
+extern int p32x_par_on;
+extern unsigned int p32x_par_target;
+void p32x_par_start(void);
+void p32x_par_stop(void);
+void p32x_par_release(unsigned int m68k_now);
+void p32x_par_barrier(unsigned int m68k_now);
+void p32x_par_frame_sync(unsigned int m68k_now);
+void p32x_par_pwm_sync(unsigned int m68k_now);
+void p32x_par_enter(unsigned int m68k_now);
+void p32x_par_leave(void);
+int p32x_par_work(void);
+int p32x_par_pending(void);
+void p32x_par_wake_m68k(void);
+void plat_sh2_thread_kick(void);
+// the frame-level sync points of the 68k side (vblank, render, timers, PWM)
+#define P32X_PAR_BARRIER() do { if (p32x_par_on) p32x_par_frame_sync(SekCyclesDone()); } while (0)
+#define P32X_PAR_LEAVE() do { if (p32x_par_on) p32x_par_leave(); } while (0)
+// the 68k's time as the SH-2 side sees it: the sync target when parallel
+#define P32X_SH2_M68K_NOW() (p32x_par_on ? p32x_par_target : SekCyclesDone())
+// Pico32x.emu_flags is changed from both threads
+#define P32X_FLAGS_SET(f) __atomic_fetch_or(&Pico32x.emu_flags, (f), __ATOMIC_RELAXED)
+#define P32X_FLAGS_CLR(f) __atomic_fetch_and(&Pico32x.emu_flags, ~(unsigned)(f), __ATOMIC_RELAXED)
+// the 68k's comm reads and the interrupt register: the SH-2s near its time
+// but not stopped (they are what it polls; the poll fifo has a lock of its own)
+void p32x_par_catch_up(unsigned int m68k_now, unsigned int lag);
+#else
+#define p32x_par_on 0
+#define p32x_par_stop()
+#define P32X_PAR_BARRIER() do { } while (0)
+#define P32X_PAR_LEAVE() do { } while (0)
+#define P32X_SH2_M68K_NOW() SekCyclesDone()
+#define P32X_FLAGS_SET(f) (Pico32x.emu_flags |= (f))
+#define P32X_FLAGS_CLR(f) (Pico32x.emu_flags &= ~(f))
+#endif
 void p32x_sync_other_sh2(SH2 *sh2, unsigned int m68k_target);
 void p32x_update_irls(SH2 *active_sh2, unsigned int m68k_cycles);
 void p32x_trigger_irq(SH2 *sh2, unsigned int m68k_cycles, unsigned int mask);

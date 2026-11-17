@@ -524,7 +524,8 @@ extern M68K_CONTEXT PicoCpuFS68k;
 /* Custom function handler */
 typedef void (*opcode_func)(M68K_CONTEXT *ctx);
 
-static opcode_func JumpTable[0x10000];
+// (allocated by fm68k_init: 256 KB a platform may not want resident)
+static opcode_func *JumpTable;
 
 // exception cycle table (taken from musashi core)
 static const s32 exception_cycle_table[256] =
@@ -619,12 +620,24 @@ void fm68k_init(void)
 	puts("Initializing FAME...");
 #endif
 
+	if (!JumpTable) {
+		JumpTable = malloc(0x10000 * sizeof(*JumpTable));
+		initialised = 0;
+	}
 	if (!initialised)
 		init_jump_table();
 
 #ifdef FAMEC_DEBUG
 	puts("FAME initialized.");
 #endif
+}
+
+// the jump table back to the heap (fm68k_init builds it again)
+void fm68k_free_tables(void)
+{
+	free(JumpTable);
+	JumpTable = NULL;
+	initialised = 0;
 }
 
 /******************************************************************************/

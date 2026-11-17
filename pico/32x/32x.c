@@ -144,6 +144,7 @@ void Pico32xStartup(void)
 void Pico32xShutdown(void)
 {
   elprintf(EL_STATUS|EL_32X, "32X shutdown");
+  p32x_par_stop();
   Pico32x.sh2_regs[0] &= ~P32XS2_ADEN;
   Pico32x.regs[0] &= ~P32XS_ADEN;
 
@@ -240,6 +241,7 @@ void PicoUnload32x(void)
 
 void PicoReset32x(void)
 {
+  P32X_PAR_BARRIER();
   if (PicoIn.AHW & PAHW_32X) {
     p32x_trigger_irq(NULL, Pico.t.m68c_aim, P32XI_VRES);
     p32x_m68k_poll_event(0, -1);
@@ -272,6 +274,8 @@ static void Pico32xRenderSync(int lines)
 
 void Pico32xDrawSync(SH2 *sh2)
 {
+  if (p32x_par_on && sh2)
+    return; // (the MD renderer belongs to the 68k thread)
   // the fast renderer isn't operating on a line-by-line base
   if (sh2 && !(PicoIn.opt & POPT_ALT_RENDERER) && !PicoIn.skipFrame) {
     unsigned int cycle = (sh2 ? sh2_cycles_done_m68k(sh2) : SekCyclesDone());
@@ -302,12 +306,16 @@ void Pico32xDrawSync(SH2 *sh2)
 
 static void p32x_render_frame(void)
 {
+  // the SH-2s up to here, then on with the next frame while this one is
+  // drawn: they draw into the other frame buffer, the swap waits for vblank
+  // (no sync with SH-2s on their own thread: the front buffer only changes in
+  // vblank, which reaches them as an event once they get there)
   if (Pico32xDrawMode != PDM32X_OFF && !PicoIn.skipFrame)
     Pico32xRenderSync(rendlines-1);
   Pico32x.sync_line = rendlines;
 }
 
-static void p32x_start_blank(void)
+static void vblank_start_event(unsigned int now)
 {
   // enter vblank
   Pico32x.vdp_regs[0x0a/2] |= P32XV_VBLK|P32XV_PEN;
@@ -318,12 +326,25 @@ static void p32x_start_blank(void)
     Pico32xSwapDRAM(Pico32x.pending_fb ^ P32XV_FS);
   }
 
-  p32x_trigger_irq(NULL, Pico.t.m68c_aim, P32XI_VINT);
-  p32x_sh2_poll_event(msh2.poll_addr, &msh2, SH2_STATE_VPOLL, Pico.t.m68c_aim);
-  p32x_sh2_poll_event(ssh2.poll_addr, &ssh2, SH2_STATE_VPOLL, Pico.t.m68c_aim);
+  p32x_trigger_irq(NULL, now, P32XI_VINT);
+  p32x_sh2_poll_event(msh2.poll_addr, &msh2, SH2_STATE_VPOLL, now);
+  p32x_sh2_poll_event(ssh2.poll_addr, &ssh2, SH2_STATE_VPOLL, now);
 }
 
-static void p32x_end_blank(void)
+// with the SH-2s on their own thread, the 68k side's vblank changes reach
+// the 32X as events at their time: nobody waits for the SH-2s to get there
+static void p32x_start_blank(void)
+{
+#ifdef P32X_SH2_THREAD
+  if (p32x_par_on) {
+    p32x_par_post_event(P32X_EVENT_VBLANK, Pico.t.m68c_aim);
+    return;
+  }
+#endif
+  vblank_start_event(Pico.t.m68c_aim);
+}
+
+static void vblank_end_event(unsigned int now)
 {
   // end vblank
   Pico32x.vdp_regs[0x0a/2] &= ~P32XV_VBLK; // get out of vblank
@@ -332,11 +353,22 @@ static void p32x_end_blank(void)
   if (!(Pico32x.sh2_regs[0] & 0x80)) {
     // Hint on 32X is taking place some 13 H40 px after HBLANK on MD
     Pico32x.hint_counter = (13 * 16/7) << 4;
-    p32x_schedule_hint(NULL, Pico.t.m68c_aim);
+    p32x_schedule_hint(NULL, now);
   }
 
-  p32x_sh2_poll_event(msh2.poll_addr, &msh2, SH2_STATE_VPOLL, Pico.t.m68c_aim);
-  p32x_sh2_poll_event(ssh2.poll_addr, &ssh2, SH2_STATE_VPOLL, Pico.t.m68c_aim);
+  p32x_sh2_poll_event(msh2.poll_addr, &msh2, SH2_STATE_VPOLL, now);
+  p32x_sh2_poll_event(ssh2.poll_addr, &ssh2, SH2_STATE_VPOLL, now);
+}
+
+static void p32x_end_blank(void)
+{
+#ifdef P32X_SH2_THREAD
+  if (p32x_par_on) {
+    p32x_par_post_event(P32X_EVENT_VBLANK_END, Pico.t.m68c_aim);
+    return;
+  }
+#endif
+  vblank_end_event(Pico.t.m68c_aim);
 }
 
 void p32x_schedule_hint(SH2 *sh2, unsigned int m68k_cycles)
@@ -393,6 +425,8 @@ static event_cb *p32x_event_cbs[P32X_EVENT_COUNT] = {
   hint_event,         // P32X_EVENT_HINT
   mtimer_event,       // P32X_EVENT_MTIMER
   stimer_event,       // P32X_EVENT_STIMER
+  vblank_start_event, // P32X_EVENT_VBLANK
+  vblank_end_event,   // P32X_EVENT_VBLANK_END
 };
 
 // schedule event at some time 'after', in m68k clocks
@@ -414,8 +448,10 @@ void p32x_event_schedule_sh2(SH2 *sh2, enum p32x_event event, int after)
   unsigned int now = sh2_cycles_done_m68k(sh2);
   int left_to_next;
 
+  // (an idle SH-2's clock lags: from the 68k's time, or, with the SH-2s on
+  // their own thread, the time they run to: the 68k's may be behind theirs)
   if (sh2->state & SH2_IDLE_STATES)
-    now = SekCyclesDone();
+    now = P32X_SH2_M68K_NOW();
 
   p32x_event_schedule(now, event, after);
 
@@ -526,11 +562,47 @@ void p32x_sync_other_sh2(SH2 *sh2, unsigned int m68k_target)
 #define STEP_LS 24
 #define STEP_N 164 // NFL, Xmen; TODO at least a scanline (489) for good perf?
 
+#ifdef PD_SH2_STATS
+// host cycles spent running each SH-2, and in the whole sync (the platform
+// reads and resets them)
+unsigned int pd_stat_clock(void);
+unsigned int pd_stat_sh2_cycles[3];
+#define SH2_STAT_START() unsigned int stat_t0_ = pd_stat_clock()
+#define SH2_STAT_END(i) pd_stat_sh2_cycles[i] += pd_stat_clock() - stat_t0_
+#else
+#define SH2_STAT_START()
+#define SH2_STAT_END(i)
+#endif
+
+#ifdef P32X_SH2_THREAD
+#include <stdatomic.h>
+// on their own thread, the SH-2s run in shorter slices: the 68k side waits
+// for the current one to end whenever it touches 32X state
+#ifndef P32X_PAR_STEP
+#define P32X_PAR_STEP 48
+#endif
+#define SYNC_STEP (p32x_par_on ? P32X_PAR_STEP : STEP_N)
+// the 68k side wants the SH-2s to stop at their next slice
+static atomic_int par_park;
+static atomic_uint par_req, par_done;  // m68k times: allowed, reached
+static unsigned int sync_sh2s_normal(unsigned int m68k_target);
+#define SYNC_RET unsigned int
+#define SYNC_RETURN(t) return (t)
+#else
+#define SYNC_STEP STEP_N
 #define sync_sh2s_normal p32x_sync_sh2s
+#define SYNC_RET void
+#define SYNC_RETURN(t) return
+#endif
 //#define sync_sh2s_lockstep p32x_sync_sh2s
 
 /* most timing is in 68k clock */
-void sync_sh2s_normal(unsigned int m68k_target)
+#ifdef P32X_SH2_THREAD
+static
+#endif
+// (when parallel: returns the time reached, earlier than m68k_target when
+// the 68k side asked them to stop)
+SYNC_RET sync_sh2s_normal(unsigned int m68k_target)
 {
   unsigned int now, target, next;
   int cycles;
@@ -539,13 +611,16 @@ void sync_sh2s_normal(unsigned int m68k_target)
 
   if ((Pico32x.regs[0] & (P32XS_nRES|P32XS_ADEN)) != (P32XS_nRES|P32XS_ADEN)) {
     msh2.m68krcycles_done = ssh2.m68krcycles_done = m68k_target;
-    return; // rare
+    SYNC_RETURN(m68k_target); // rare
   }
 
   now = msh2.m68krcycles_done;
   if (CYCLES_GT(now, ssh2.m68krcycles_done))
     now = ssh2.m68krcycles_done;
 
+#ifdef PD_SH2_STATS
+  unsigned int stat_sync0_ = pd_stat_clock();
+#endif
   pprof_start(m68k);
   while (CYCLES_GT(m68k_target, now))
   {
@@ -558,8 +633,8 @@ void sync_sh2s_normal(unsigned int m68k_target)
     while (CYCLES_GT(target, now))
     {
       next = target;
-      if (CYCLES_GT(target, now + STEP_N))
-        next = now + STEP_N;
+      if (CYCLES_GT(target, now + SYNC_STEP))
+        next = now + SYNC_STEP;
       elprintf(EL_32X, "sh2 exec to %u %d,%d/%d, flags %x", next,
         next - msh2.m68krcycles_done, next - ssh2.m68krcycles_done,
         m68k_target - now, Pico32x.emu_flags);
@@ -568,7 +643,9 @@ void sync_sh2s_normal(unsigned int m68k_target)
       if (!(ssh2.state & SH2_IDLE_STATES)) {
         cycles = next - ssh2.m68krcycles_done;
         if (cycles > 0) {
+          SH2_STAT_START();
           run_sh2(&ssh2, cycles > 20U ? cycles : 20U);
+          SH2_STAT_END(1);
 
           if (event_time_next && CYCLES_GT(target, event_time_next))
             target = event_time_next;
@@ -582,7 +659,9 @@ void sync_sh2s_normal(unsigned int m68k_target)
       if (!(msh2.state & SH2_IDLE_STATES)) {
         cycles = next - msh2.m68krcycles_done;
         if (cycles > 0) {
+          SH2_STAT_START();
           run_sh2(&msh2, cycles > 20U ? cycles : 20U);
+          SH2_STAT_END(0);
 
           if (event_time_next && CYCLES_GT(target, event_time_next))
             target = event_time_next;
@@ -601,9 +680,25 @@ void sync_sh2s_normal(unsigned int m68k_target)
         if (!(ssh2.state & SH2_IDLE_STATES)) 
           now = ssh2.m68krcycles_done;
       }
+#ifdef P32X_SH2_THREAD
+      if (p32x_par_on) {
+        // where they are, for the 68k side waiting for them to get there
+        atomic_store_explicit(&par_done, now, memory_order_release);
+        if (atomic_load_explicit(&par_park, memory_order_relaxed)) {
+          m68k_target = now; // stop here, the 68k side wants the 32X
+          goto parked;
+        }
+      }
+#endif
     }
   }
+#ifdef P32X_SH2_THREAD
+parked:
+#endif
   pprof_end_sub(m68k);
+#ifdef PD_SH2_STATS
+  pd_stat_sh2_cycles[2] += pd_stat_clock() - stat_sync0_;
+#endif
 
   // advance idle CPUs
   if (msh2.state & SH2_IDLE_STATES) {
@@ -614,6 +709,7 @@ void sync_sh2s_normal(unsigned int m68k_target)
     if (CYCLES_GT(m68k_target, ssh2.m68krcycles_done))
       ssh2.m68krcycles_done = m68k_target;
   }
+  SYNC_RETURN(m68k_target);
 }
 
 void sync_sh2s_lockstep(unsigned int m68k_target)
@@ -630,7 +726,254 @@ void sync_sh2s_lockstep(unsigned int m68k_target)
   }
 }
 
+#ifdef P32X_SH2_THREAD
+int p32x_par_on;
+unsigned int p32x_par_target;          // the time the SH-2 thread runs to
+static atomic_int par_running;         // the SH-2 thread is in a sync
+static atomic_int par_m68k_wake;       // the SH-2s ended the 68k's polling
+#ifndef P32X_PAR_LAX
+#define P32X_PAR_LAX 244 // m68k cycles the SH-2s may trail a 68k access by
+#endif                   // (what the serial scheduler allows comm reads)
+#ifndef P32X_PAR_LAX_FRAME
+#define P32X_PAR_LAX_FRAME 1954 // ... at the frame's sync points (vblank, the
+#endif                          // 32X layer render, timers, PWM mixing)
+#ifndef P32X_PAR_LAX_PWM
+#define P32X_PAR_LAX_PWM 32768 // ... when the PWM is mixed (a quarter frame)
+#endif
+#ifndef P32X_PAR_AHEAD
+#define P32X_PAR_AHEAD 244 // ... and may run ahead of the 68k: work for them
+#endif                     // while the 68k side renders, mixes, ...
+#ifdef PD_SH2_STATS
+#include <stdlib.h>
+// a wait that never ends: abort, for a core dump with every thread's stack
+#define PAR_SPIN_START() unsigned int spin_t0_ = pd_stat_clock()
+#define PAR_SPIN_CHECK() do { if (pd_stat_clock() - spin_t0_ > 720000000u) abort(); } while (0)
+#else
+#define PAR_SPIN_START()
+#define PAR_SPIN_CHECK()
+#endif
+#ifdef PD_SH2_STATS
+// accesses, the 68k thread's cycles waiting at them, the m68k cycles the
+// SH-2s trailed by, poll throttles and their wait
+unsigned int pd_stat_par[12];
+#define PAR_STAT(x) x
+#else
+#define PAR_STAT(x)
+#endif
+
+void p32x_sync_sh2s(unsigned int m68k_target)
+{
+  if (p32x_par_on)
+    p32x_par_barrier(m68k_target);
+  else
+    sync_sh2s_normal(m68k_target);
+}
+
+// 68k thread: the SH-2s may run up to m68k_now (and a little beyond)
+void p32x_par_release(unsigned int m68k_now)
+{
+  m68k_now += P32X_PAR_AHEAD;
+  if (CYCLES_GT(m68k_now, atomic_load_explicit(&par_req, memory_order_relaxed))) {
+    atomic_store_explicit(&par_req, m68k_now, memory_order_seq_cst);
+    plat_sh2_thread_kick();
+  }
+}
+
+static void par_unpark(void)
+{
+  if (atomic_load_explicit(&par_park, memory_order_relaxed)) {
+    atomic_store_explicit(&par_park, 0, memory_order_seq_cst);
+    plat_sh2_thread_kick();
+  }
+}
+
+// the SH-2 thread out of its sync: from here on the 68k thread owns the 32X
+static void par_park_now(void)
+{
+  PAR_STAT(unsigned int pt0 = pd_stat_clock());
+  PAR_SPIN_START();
+  atomic_store_explicit(&par_park, 1, memory_order_seq_cst);
+  while (atomic_load_explicit(&par_running, memory_order_seq_cst))
+    PAR_SPIN_CHECK();
+  if (atomic_exchange_explicit(&par_m68k_wake, 0, memory_order_relaxed))
+    SekSetStop(0);
+  PAR_STAT(pd_stat_par[8] += pd_stat_clock() - pt0);
+}
+
+// let the SH-2s run until they are within `lag` of m68k_now
+void p32x_par_catch_up(unsigned int m68k_now, unsigned int lag)
+{
+#ifdef PD_SH2_STATS
+  int behind = (int)(m68k_now - atomic_load_explicit(&par_done, memory_order_relaxed));
+  unsigned int ct0 = pd_stat_clock();
+  if (lag > P32X_PAR_LAX && behind > 0) { // (frame-level and exact syncs)
+    pd_stat_par[11] += behind;
+    if ((unsigned)behind > pd_stat_par[10]) pd_stat_par[10] = behind;
+  }
+#endif
+  p32x_par_release(m68k_now);
+  if (CYCLES_GT(m68k_now - lag, atomic_load_explicit(&par_done, memory_order_acquire))) {
+    PAR_SPIN_START();
+    par_unpark();
+    while (CYCLES_GT(m68k_now - lag, atomic_load_explicit(&par_done, memory_order_acquire)))
+      PAR_SPIN_CHECK();
+  }
+  PAR_STAT(pd_stat_par[9] += pd_stat_clock() - ct0);
+}
+
+// 68k thread: the SH-2s at least at m68k_now (at most P32X_PAR_AHEAD
+// beyond) and stopped until the 68k side lets them go again
+void p32x_par_barrier(unsigned int m68k_now)
+{
+  PAR_STAT(unsigned int t0 = pd_stat_clock());
+  PAR_STAT(pd_stat_par[5]++);
+  p32x_par_catch_up(m68k_now, 0);
+  par_park_now();
+  PAR_STAT(pd_stat_par[6] += pd_stat_clock() - t0);
+}
+
+// 68k thread, at the frame's sync points: the SH-2s stopped within
+// P32X_PAR_LAX_FRAME of the 68k (until P32X_PAR_LEAVE())
+void p32x_par_frame_sync(unsigned int m68k_now)
+{
+  PAR_STAT(unsigned int t0 = pd_stat_clock());
+  PAR_STAT(pd_stat_par[5]++);
+  p32x_par_catch_up(m68k_now, P32X_PAR_LAX_FRAME);
+  par_park_now();
+  PAR_STAT(pd_stat_par[6] += pd_stat_clock() - t0);
+}
+
+// 68k thread: the 68k side changes 32X state at m68k_now, as an event the
+// SH-2 thread applies when it gets there
+void p32x_par_post_event(enum p32x_event event, unsigned int m68k_now)
+{
+  par_park_now(); // (the event list belongs to the SH-2 thread while it runs)
+  p32x_event_schedule(m68k_now, event, 0);
+  par_unpark();
+  p32x_par_release(m68k_now);
+}
+
+// 68k thread, before mixing the PWM: its samples up to near m68k_now
+void p32x_par_pwm_sync(unsigned int m68k_now)
+{
+  p32x_par_catch_up(m68k_now, P32X_PAR_LAX_PWM);
+  par_park_now();
+}
+
+// 68k thread, around an access to 32X state: the SH-2s stopped within
+// P32X_PAR_LAX of the 68k (an access that needs them exactly there syncs
+// them further, see p32x_sync_sh2s), let go again after it
+void p32x_par_enter(unsigned int m68k_now)
+{
+  PAR_STAT(unsigned int t0 = pd_stat_clock());
+  PAR_STAT(pd_stat_par[0]++);
+  PAR_STAT({ int b_ = (int)(m68k_now - atomic_load_explicit(&par_done, memory_order_relaxed)); if (b_ > 0) pd_stat_par[2] += b_; });
+  p32x_par_catch_up(m68k_now, P32X_PAR_LAX);
+  par_park_now();
+  PAR_STAT(pd_stat_par[1] += pd_stat_clock() - t0);
+}
+
+void p32x_par_leave(void)
+{
+  par_unpark();
+}
+
+// 68k thread, while the 68k polls the 32X: the SH-2s may trail it by up to
+// max_lag (the serial scheduler syncs them every line then, which would leave
+// one thread waiting for the other all the time). The SH-2s ending the poll
+// reach the 68k at its next line once they caught up that far.
+void p32x_par_throttle(unsigned int m68k_now, unsigned int max_lag)
+{
+  PAR_STAT(unsigned int t0 = pd_stat_clock());
+  PAR_STAT(pd_stat_par[3]++);
+  p32x_par_catch_up(m68k_now, max_lag);
+  if (atomic_exchange_explicit(&par_m68k_wake, 0, memory_order_relaxed))
+    SekSetStop(0);
+  PAR_STAT(pd_stat_par[4] += pd_stat_clock() - t0);
+}
+
+// SH-2 thread: run them towards the allowed time; 0 if there was nothing to do
+int p32x_par_work(void)
+{
+  unsigned int req;
+  atomic_store_explicit(&par_running, 1, memory_order_seq_cst);
+  if (atomic_load_explicit(&par_park, memory_order_seq_cst)) {
+    atomic_store_explicit(&par_running, 0, memory_order_release);
+    return 0;
+  }
+  req = atomic_load_explicit(&par_req, memory_order_acquire);
+  if (req == atomic_load_explicit(&par_done, memory_order_relaxed)) {
+    atomic_store_explicit(&par_running, 0, memory_order_release);
+    return 0;
+  }
+  p32x_par_target = req;
+  req = sync_sh2s_normal(req);
+  p32x_timer_do(&msh2, req);
+  p32x_timer_do(&ssh2, req);
+  atomic_store_explicit(&par_done, req, memory_order_release);
+  atomic_store_explicit(&par_running, 0, memory_order_release);
+  return 1;
+}
+
+int p32x_par_pending(void)
+{
+  return !atomic_load_explicit(&par_park, memory_order_seq_cst) &&
+         atomic_load_explicit(&par_req, memory_order_seq_cst) !=
+         atomic_load_explicit(&par_done, memory_order_relaxed);
+}
+
+// SH-2 thread: the 68k's polling ended; it resumes at its next run
+void p32x_par_wake_m68k(void)
+{
+  atomic_store_explicit(&par_m68k_wake, 1, memory_order_relaxed);
+}
+
+// 68k thread, with the SH-2s idle
+void p32x_par_start(void)
+{
+  unsigned int now = SekCyclesDone();
+  if (p32x_par_on || !(PicoIn.AHW & PAHW_32X))
+    return;
+  atomic_store(&par_req, now);
+  atomic_store(&par_done, now);
+  atomic_store(&par_park, 0);
+  p32x_par_on = 1;
+}
+
+void p32x_par_stop(void)
+{
+  if (!p32x_par_on)
+    return;
+  p32x_par_barrier(SekCyclesDone());
+  p32x_par_on = 0;
+  atomic_store(&par_park, 0);
+}
+
+// at the start of each 68k line: the SH-2s go on (to where the 68k is)
+#define PAR_RUN_HOOK() do { \
+  if (p32x_par_on) { \
+    if (atomic_exchange_explicit(&par_m68k_wake, 0, memory_order_relaxed)) \
+      SekSetStop(0); \
+    par_unpark(); \
+    p32x_par_release(SekCyclesDone()); \
+  } \
+} while (0)
+#ifndef P32X_PAR_MAX_LAG
+#define P32X_PAR_MAX_LAG 977 // m68k cycles: two scanlines
+#endif
+#define PAR_POLL_SYNC(now) do { \
+  if (p32x_par_on) \
+    p32x_par_throttle(now, P32X_PAR_MAX_LAG); \
+  else \
+    p32x_sync_sh2s(now); \
+} while (0)
+#else
+#define PAR_RUN_HOOK() do { } while (0)
+#define PAR_POLL_SYNC(now) p32x_sync_sh2s(now)
+#endif
+
 #define CPUS_RUN(m68k_cycles) do { \
+  PAR_RUN_HOOK(); \
   if (PicoIn.AHW & PAHW_MCD) \
     pcd_run_cpus(m68k_cycles); \
   else \
@@ -640,7 +983,7 @@ void sync_sh2s_lockstep(unsigned int m68k_target)
       && !Pico.m.z80_reset && (PicoIn.opt & POPT_EN_Z80)) \
     PicoSyncZ80(SekCyclesDone()); \
   if (Pico32x.emu_flags & (P32XF_68KCPOLL|P32XF_68KVPOLL)) \
-    p32x_sync_sh2s(SekCyclesDone()); \
+    PAR_POLL_SYNC(SekCyclesDone()); \
 } while (0)
 
 #define PICO_32X
@@ -661,8 +1004,10 @@ void PicoFrame32x(void)
   DrawLineDest32x = DrawLineDestBase32x + offs * DrawLineDestIncrement32x;
   PicoFrameHints();
 
-  p32x_timer_do(&msh2, Pico.t.m68c_aim);
-  p32x_timer_do(&ssh2, Pico.t.m68c_aim);
+  if (!p32x_par_on) { // (else the SH-2 thread keeps them, see p32x_par_work)
+    p32x_timer_do(&msh2, Pico.t.m68c_aim);
+    p32x_timer_do(&ssh2, Pico.t.m68c_aim);
+  }
 
   elprintf(EL_32X, "poll: %02x %02x %02x",
     Pico32x.emu_flags & 3, msh2.state, ssh2.state);

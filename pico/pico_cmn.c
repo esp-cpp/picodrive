@@ -93,6 +93,11 @@ static void SyncCPUs(unsigned int cycles)
     pcd_sync_s68k(cycles, 0);
 #endif
 #ifdef PICO_32X
+#ifdef P32X_SH2_THREAD
+  if (p32x_par_on)
+    ; // (the SH-2s on their own thread follow the 68k by themselves)
+  else
+#endif
   p32x_sync_sh2s(cycles);
 #endif
 }
