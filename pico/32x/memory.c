@@ -678,6 +678,39 @@ static void p32x_reg_write16(u32 a, u32 d)
   p32x_reg_write8(a + 1, d);
 }
 
+#ifdef P32X_SH2_THREAD
+// SH-2 thread: a 68k write queued by p32x_par_queue_write, at its time
+// (what p32x_reg_write8/16 do, less the sync: this is the SH-2s' time)
+void p32x_par_apply_write(u32 a, u32 d, unsigned int cycles)
+{
+  u16 *r = Pico32x.regs;
+
+  if (a == 0x03) { // irq ctl
+    if ((d ^ r[0x02 / 2]) & 3) {
+      r[0x02 / 2] = d & 3;
+      p32x_update_cmd_irq(NULL, cycles);
+    }
+    return;
+  }
+  if (a & P32X_PAR_W8) { // comm port, a byte
+    a &= 0x3f;
+    if (REG8IN16(r, a) != (u8)d) {
+      REG8IN16(r, a) = d;
+      p32x_sh2_poll_event(a, &sh2s[0], SH2_STATE_CPOLL, cycles);
+      p32x_sh2_poll_event(a, &sh2s[1], SH2_STATE_CPOLL, cycles);
+      sh2_poll_write(a & ~1, r[a / 2], cycles, NULL);
+    }
+    return;
+  }
+  if (r[a / 2] != (u16)d) { // comm port
+    r[a / 2] = d;
+    p32x_sh2_poll_event(a, &sh2s[0], SH2_STATE_CPOLL, cycles);
+    p32x_sh2_poll_event(a, &sh2s[1], SH2_STATE_CPOLL, cycles);
+    sh2_poll_write(a, (u16)d, cycles, NULL);
+  }
+}
+#endif
+
 // ------------------------------------------------------------------
 // VDP regs
 static u32 p32x_vdp_read16(u32 a)
@@ -1214,6 +1247,13 @@ static void PicoWrite8_32x_on(u32 a, u32 d)
     PicoWrite8_32x_on_(a, d);
     return;
   }
+  // comm ports and the SH-2 interrupt control: to the SH-2s at their time
+  if ((a & 0xffc0) == 0x5100 && ((a & 0x30) == 0x20 || (a & 0x3f) == 0x03)) {
+    m68k_poll.cnt = 0;
+    p32x_par_queue_write((a & 0x3f) | ((a & 0x30) == 0x20 ? P32X_PAR_W8 : 0),
+      d & 0xff, SekCyclesDone());
+    return;
+  }
   ACC_STAT(1, a);
   p32x_par_enter(SekCyclesDone());
   PicoWrite8_32x_on_(a, d);
@@ -1282,6 +1322,15 @@ static void PicoWrite16_32x_on(u32 a, u32 d)
 {
   if ((a & 0xfc00) != 0x5000 || !p32x_par_on) {
     PicoWrite16_32x_on_(a, d);
+    return;
+  }
+  // comm ports and the SH-2 interrupt control: to the SH-2s at their time
+  if ((a & 0xffc0) == 0x5100 && ((a & 0x30) == 0x20 || (a & 0x3e) == 0x02)) {
+    m68k_poll.cnt = 0;
+    if ((a & 0x30) == 0x20)
+      p32x_par_queue_write(a & 0x3e, d & 0xffff, SekCyclesDone());
+    else // (the high byte is always 0)
+      p32x_par_queue_write(0x03, d & 0xff, SekCyclesDone());
     return;
   }
   ACC_STAT(1, a);

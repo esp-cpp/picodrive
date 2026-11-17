@@ -7112,3 +7112,28 @@ end:
 }
 
 // vim:shiftwidth=2:ts=2:expandtab
+
+#ifdef PD_SH2_STATS
+// for a profiler: the translated blocks (SH-2 address and size, host code)
+// and their entry points, one per line
+void sh2_drc_dump_blocks(FILE *f)
+{
+  int b, i, j;
+
+  for (b = 0; b < TCACHE_BUFFERS; b++) {
+    if (block_tables[b] == NULL)
+      continue;
+    for (i = 0; i < BLOCK_MAX_COUNT(b); i++) {
+      struct block_desc *bd = &block_tables[b][i];
+      if (bd->addr == 0 || !bd->active)
+        continue;
+      fprintf(f, "B %d %08x %d %p\n", b, bd->addr, bd->size, bd->tcache_ptr);
+      for (j = 0; j < bd->entry_count; j++)
+        fprintf(f, "E %08x %p\n", bd->entryp[j].pc, bd->entryp[j].tcache_ptr);
+    }
+  }
+  fprintf(f, "U write8 %p write16 %p write32 %p read8 %p read16 %p read32 %p dispatcher %p\n",
+    sh2_drc_write8, sh2_drc_write16, sh2_drc_write32, sh2_drc_read8,
+    sh2_drc_read16, sh2_drc_read32, sh2_drc_dispatcher);
+}
+#endif

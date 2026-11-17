@@ -576,16 +576,21 @@ unsigned int pd_stat_sh2_cycles[3];
 
 #ifdef P32X_SH2_THREAD
 #include <stdatomic.h>
-// on their own thread, the SH-2s run in shorter slices: the 68k side waits
-// for the current one to end whenever it touches 32X state
+// on their own thread, the SH-2s run in the serial scheduler's slices: the
+// 68k side waits for the current one to end whenever it stops them (rarely:
+// its comm and interrupt writes are queued, see p32x_par_queue_write)
 #ifndef P32X_PAR_STEP
-#define P32X_PAR_STEP 48
+#define P32X_PAR_STEP STEP_N
 #endif
 #define SYNC_STEP (p32x_par_on ? P32X_PAR_STEP : STEP_N)
 // the 68k side wants the SH-2s to stop at their next slice
 static atomic_int par_park;
 static atomic_uint par_req, par_done;  // m68k times: allowed, reached
 static unsigned int sync_sh2s_normal(unsigned int m68k_target);
+static void par_wq_apply(unsigned int now);
+static int par_wq_next(unsigned int *time);
+static atomic_uint par_wq_rd, par_wq_wr;
+static unsigned int par_wq_last; // 68k thread: the time of the last one queued
 #define SYNC_RET unsigned int
 #define SYNC_RETURN(t) return (t)
 #else
@@ -611,6 +616,10 @@ SYNC_RET sync_sh2s_normal(unsigned int m68k_target)
 
   if ((Pico32x.regs[0] & (P32XS_nRES|P32XS_ADEN)) != (P32XS_nRES|P32XS_ADEN)) {
     msh2.m68krcycles_done = ssh2.m68krcycles_done = m68k_target;
+#ifdef P32X_SH2_THREAD
+    if (p32x_par_on)
+      par_wq_apply(m68k_target);
+#endif
     SYNC_RETURN(m68k_target); // rare
   }
 
@@ -635,6 +644,15 @@ SYNC_RET sync_sh2s_normal(unsigned int m68k_target)
       next = target;
       if (CYCLES_GT(target, now + SYNC_STEP))
         next = now + SYNC_STEP;
+#ifdef P32X_SH2_THREAD
+      if (p32x_par_on) {
+        // the 68k's queued writes up to here; stop at the next one
+        unsigned int wt;
+        par_wq_apply(now);
+        if (par_wq_next(&wt) && CYCLES_GT(next, wt))
+          next = wt;
+      }
+#endif
       elprintf(EL_32X, "sh2 exec to %u %d,%d/%d, flags %x", next,
         next - msh2.m68krcycles_done, next - ssh2.m68krcycles_done,
         m68k_target - now, Pico32x.emu_flags);
@@ -683,6 +701,8 @@ SYNC_RET sync_sh2s_normal(unsigned int m68k_target)
 #ifdef P32X_SH2_THREAD
       if (p32x_par_on) {
         // where they are, for the 68k side waiting for them to get there
+        // (with what the 68k wrote until then)
+        par_wq_apply(now);
         atomic_store_explicit(&par_done, now, memory_order_release);
         if (atomic_load_explicit(&par_park, memory_order_relaxed)) {
           m68k_target = now; // stop here, the 68k side wants the 32X
@@ -755,7 +775,7 @@ static atomic_int par_m68k_wake;       // the SH-2s ended the 68k's polling
 #ifdef PD_SH2_STATS
 // accesses, the 68k thread's cycles waiting at them, the m68k cycles the
 // SH-2s trailed by, poll throttles and their wait
-unsigned int pd_stat_par[12];
+unsigned int pd_stat_par[16];
 #define PAR_STAT(x) x
 #else
 #define PAR_STAT(x)
@@ -800,9 +820,15 @@ static void par_park_now(void)
   PAR_STAT(pd_stat_par[8] += pd_stat_clock() - pt0);
 }
 
-// let the SH-2s run until they are within `lag` of m68k_now
+// let the SH-2s run until they are within `lag` of m68k_now, and past the
+// 68k's queued writes, with those applied: whatever the 68k does next comes
+// after them for the SH-2s too
 void p32x_par_catch_up(unsigned int m68k_now, unsigned int lag)
 {
+  unsigned int wr = atomic_load_explicit(&par_wq_wr, memory_order_relaxed);
+  int queued = atomic_load_explicit(&par_wq_rd, memory_order_acquire) != wr;
+  if (queued && CYCLES_GT(lag, m68k_now - par_wq_last))
+    lag = m68k_now - par_wq_last;
 #ifdef PD_SH2_STATS
   int behind = (int)(m68k_now - atomic_load_explicit(&par_done, memory_order_relaxed));
   unsigned int ct0 = pd_stat_clock();
@@ -816,6 +842,13 @@ void p32x_par_catch_up(unsigned int m68k_now, unsigned int lag)
     PAR_SPIN_START();
     par_unpark();
     while (CYCLES_GT(m68k_now - lag, atomic_load_explicit(&par_done, memory_order_acquire)))
+      PAR_SPIN_CHECK();
+  }
+  if (queued && atomic_load_explicit(&par_wq_rd, memory_order_acquire) != wr) {
+    // (written where they already were: applied at their next run)
+    PAR_SPIN_START();
+    par_unpark();
+    while (atomic_load_explicit(&par_wq_rd, memory_order_acquire) != wr)
       PAR_SPIN_CHECK();
   }
   PAR_STAT(pd_stat_par[9] += pd_stat_clock() - ct0);
@@ -892,14 +925,71 @@ void p32x_par_throttle(unsigned int m68k_now, unsigned int max_lag)
   PAR_STAT(pd_stat_par[4] += pd_stat_clock() - t0);
 }
 
+// the 68k's queued writes (p32x_par_queue_write): the 68k thread adds at
+// par_wq_wr, the SH-2 thread applies at par_wq_rd
+#define PAR_WQ_SIZE 256
+static struct par_wq_entry {
+  unsigned int time;
+  u16 a, d;
+} par_wq[PAR_WQ_SIZE];
+void p32x_par_queue_write(u32 a, u32 d, unsigned int m68k_now)
+{
+  unsigned int wr = atomic_load_explicit(&par_wq_wr, memory_order_relaxed);
+  struct par_wq_entry *e;
+  PAR_STAT(pd_stat_par[12]++);
+  if (wr - atomic_load_explicit(&par_wq_rd, memory_order_acquire) >= PAR_WQ_SIZE) {
+    // full: the SH-2s up to here, which empties it
+    PAR_STAT(pd_stat_par[13]++);
+    p32x_par_barrier(m68k_now);
+    par_unpark();
+  }
+  e = &par_wq[wr % PAR_WQ_SIZE];
+  e->time = m68k_now;
+  e->a = a;
+  e->d = d;
+  par_wq_last = m68k_now;
+  atomic_store_explicit(&par_wq_wr, wr + 1, memory_order_seq_cst);
+  p32x_par_release(m68k_now);
+  plat_sh2_thread_kick(); // (if it sleeps: p32x_par_pending says there's work)
+}
+
+// SH-2 thread: the queued writes up to now
+static void par_wq_apply(unsigned int now)
+{
+  unsigned int rd = atomic_load_explicit(&par_wq_rd, memory_order_relaxed);
+  while (rd != atomic_load_explicit(&par_wq_wr, memory_order_acquire)) {
+    struct par_wq_entry *e = &par_wq[rd % PAR_WQ_SIZE];
+    if (CYCLES_GT(e->time, now))
+      break;
+    p32x_par_apply_write(e->a, e->d, e->time);
+    atomic_store_explicit(&par_wq_rd, ++rd, memory_order_release);
+  }
+}
+
+// SH-2 thread: the time of the next queued write, if any
+static int par_wq_next(unsigned int *time)
+{
+  unsigned int rd = atomic_load_explicit(&par_wq_rd, memory_order_relaxed);
+  if (rd == atomic_load_explicit(&par_wq_wr, memory_order_acquire))
+    return 0;
+  *time = par_wq[rd % PAR_WQ_SIZE].time;
+  return 1;
+}
+
 // SH-2 thread: run them towards the allowed time; 0 if there was nothing to do
 int p32x_par_work(void)
 {
-  unsigned int req;
+  unsigned int req, wt;
   atomic_store_explicit(&par_running, 1, memory_order_seq_cst);
   if (atomic_load_explicit(&par_park, memory_order_seq_cst)) {
     atomic_store_explicit(&par_running, 0, memory_order_release);
     return 0;
+  }
+  // the 68k's writes queued at times they already passed
+  req = atomic_load_explicit(&par_done, memory_order_relaxed);
+  if (par_wq_next(&wt) && !CYCLES_GT(wt, req)) {
+    p32x_par_target = req;
+    par_wq_apply(req);
   }
   req = atomic_load_explicit(&par_req, memory_order_acquire);
   if (req == atomic_load_explicit(&par_done, memory_order_relaxed)) {
@@ -910,6 +1000,7 @@ int p32x_par_work(void)
   req = sync_sh2s_normal(req);
   p32x_timer_do(&msh2, req);
   p32x_timer_do(&ssh2, req);
+  par_wq_apply(req);
   atomic_store_explicit(&par_done, req, memory_order_release);
   atomic_store_explicit(&par_running, 0, memory_order_release);
   return 1;
@@ -918,8 +1009,10 @@ int p32x_par_work(void)
 int p32x_par_pending(void)
 {
   return !atomic_load_explicit(&par_park, memory_order_seq_cst) &&
-         atomic_load_explicit(&par_req, memory_order_seq_cst) !=
-         atomic_load_explicit(&par_done, memory_order_relaxed);
+         (atomic_load_explicit(&par_req, memory_order_seq_cst) !=
+          atomic_load_explicit(&par_done, memory_order_relaxed) ||
+          atomic_load_explicit(&par_wq_rd, memory_order_relaxed) !=
+          atomic_load_explicit(&par_wq_wr, memory_order_seq_cst));
 }
 
 // SH-2 thread: the 68k's polling ended; it resumes at its next run
@@ -937,6 +1030,8 @@ void p32x_par_start(void)
   atomic_store(&par_req, now);
   atomic_store(&par_done, now);
   atomic_store(&par_park, 0);
+  atomic_store(&par_wq_rd, 0);
+  atomic_store(&par_wq_wr, 0);
   p32x_par_on = 1;
 }
 
@@ -949,6 +1044,9 @@ void p32x_par_stop(void)
   atomic_store(&par_park, 0);
 }
 
+#endif
+
+#ifdef P32X_SH2_THREAD
 // at the start of each 68k line: the SH-2s go on (to where the 68k is)
 #define PAR_RUN_HOOK() do { \
   if (p32x_par_on) { \

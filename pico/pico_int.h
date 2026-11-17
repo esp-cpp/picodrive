@@ -1144,6 +1144,13 @@ void plat_sh2_thread_kick(void);
 // the 68k's comm reads and the interrupt register: the SH-2s near its time
 // but not stopped (they are what it polls; the poll fifo has a lock of its own)
 void p32x_par_catch_up(unsigned int m68k_now, unsigned int lag);
+// the 68k's writes to the comm ports and the SH-2 interrupt control: queued
+// with their time for the SH-2 thread, which applies them when it gets there
+// (p32x_par_apply_write) instead of the 68k waiting for the SH-2s at each.
+// a: register (a15100 + a & 0x3f), P32X_PAR_W8 for a byte write to a comm port
+#define P32X_PAR_W8 0x100
+void p32x_par_queue_write(u32 a, u32 d, unsigned int m68k_now);
+void p32x_par_apply_write(u32 a, u32 d, unsigned int m68k_cycles);
 #else
 #define p32x_par_on 0
 #define p32x_par_stop()
